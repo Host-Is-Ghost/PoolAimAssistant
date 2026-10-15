@@ -1,0 +1,1102 @@
+name: Auto-Generate & Build Pool Aim Master APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 2. Unpack Complete Android Project & Kotlin Source Tree
+        run: |
+          echo "Generating project directory tree..."
+          mkdir -p app/src/main/java/com/example/poolaimassistant
+          mkdir -p app/src/main/res/values
+
+          # ---------------------------------------------------------
+          # 1. settings.gradle.kts
+          # ---------------------------------------------------------
+          cat << 'EOF' > settings.gradle.kts
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "PoolAimAssistant"
+          include(":app")
+          EOF
+
+          # ---------------------------------------------------------
+          # 2. Root build.gradle.kts
+          # ---------------------------------------------------------
+          cat << 'EOF' > build.gradle.kts
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+
+          # ---------------------------------------------------------
+          # 3. gradle.properties
+          # ---------------------------------------------------------
+          cat << 'EOF' > gradle.properties
+          org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          android.nonTransitiveRClass=true
+          EOF
+
+          # ---------------------------------------------------------
+          # 4. app/build.gradle.kts (Includes OpenCV 4.9.0)
+          # ---------------------------------------------------------
+          cat << 'EOF' > app/build.gradle.kts
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.poolaimassistant"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.poolaimassistant"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.12.0")
+              implementation("androidx.appcompat:appcompat:1.6.1")
+              implementation("com.google.android.material:material:1.11.0")
+              implementation("org.opencv:opencv:4.9.0")
+          }
+          EOF
+
+          # ---------------------------------------------------------
+          # 5. app/src/main/AndroidManifest.xml
+          # ---------------------------------------------------------
+          cat << 'EOF' > app/src/main/AndroidManifest.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <queries>
+                  <package android:name="com.miniclip.eightballpool" />
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Aim Master Pro"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.AppCompat.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".AimOverlayService"
+                      android:enabled="true"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+              </application>
+          </manifest>
+          EOF
+
+          # ---------------------------------------------------------
+          # 6. AutoTableVisionEngine.kt (OpenCV Auto-Table & 3-Line Vision)
+          # ---------------------------------------------------------
+          cat << 'EOF' > app/src/main/java/com/example/poolaimassistant/AutoTableVisionEngine.kt
+          package com.example.poolaimassistant
+
+          import android.graphics.Bitmap
+          import android.graphics.PointF
+          import android.graphics.RectF
+          import android.media.Image
+          import org.opencv.android.OpenCVLoader
+          import org.opencv.android.Utils
+          import org.opencv.core.*
+          import org.opencv.imgproc.Imgproc
+          import kotlin.math.hypot
+
+          data class AutoAimResult(
+              val tableDetected: Boolean,
+              val tableBounds: RectF,
+              val ballRadius: Float,
+              val hasAimLine: Boolean,
+              val cueStart: PointF = PointF(),
+              val impactCenter: PointF = PointF(),
+              val aimVector: PointF = PointF(),
+              val isBallCollision: Boolean = false,
+              val objectBallVector: PointF = PointF(),
+              val cueDeflectionVector: PointF = PointF()
+          )
+
+          class AutoTableVisionEngine {
+
+              private var isOpenCvInitialized = false
+              private var cachedTableBounds: RectF? = null
+              private var frameCounter = 0
+
+              private val srcMat = Mat()
+              private val hsvMat = Mat()
+              private val maskMat = Mat()
+              private val grayMat = Mat()
+              private val linesMat = Mat()
+              private val circlesMat = Mat()
+
+              init {
+                  isOpenCvInitialized = OpenCVLoader.initLocal()
+              }
+
+              fun forceRecalibrateTable() {
+                  cachedTableBounds = null
+              }
+
+              fun analyzeFrame(image: Image): AutoAimResult {
+                  if (!isOpenCvInitialized) {
+                      isOpenCvInitialized = OpenCVLoader.initLocal()
+                      if (!isOpenCvInitialized) {
+                          return AutoAimResult(false, RectF(), 0f, false)
+                      }
+                  }
+
+                  val bitmap = imageToBitmap(image)
+                  Utils.bitmapToMat(bitmap, srcMat)
+
+                  if (cachedTableBounds == null || frameCounter % 45 == 0) {
+                      val detectedRect = autoDetectTablePlayfield(srcMat)
+                      if (detectedRect != null) {
+                          cachedTableBounds = detectedRect
+                      }
+                  }
+                  frameCounter++
+
+                  val bounds = cachedTableBounds ?: RectF(
+                      srcMat.cols() * 0.12f,
+                      srcMat.rows() * 0.16f,
+                      srcMat.cols() * 0.88f,
+                      srcMat.rows() * 0.84f
+                  )
+
+                  val dynamicBallRadius = (bounds.width() * 0.0142f).coerceAtLeast(14f)
+
+                  val left = bounds.left.toInt().coerceIn(0, srcMat.cols() - 2)
+                  val top = bounds.top.toInt().coerceIn(0, srcMat.rows() - 2)
+                  val width = bounds.width().toInt().coerceIn(1, srcMat.cols() - left)
+                  val height = bounds.height().toInt().coerceIn(1, srcMat.rows() - top)
+
+                  val roiRect = Rect(left, top, width, height)
+                  val tableRoi = Mat(srcMat, roiRect)
+
+                  Imgproc.cvtColor(tableRoi, grayMat, Imgproc.COLOR_RGBA2GRAY)
+                  Imgproc.threshold(grayMat, maskMat, 240.0, 255.0, Imgproc.THRESH_BINARY)
+
+                  Imgproc.HoughLinesP(
+                      maskMat,
+                      linesMat,
+                      1.0,
+                      Math.PI / 180.0,
+                      22,
+                      40.0,
+                      14.0
+                  )
+
+                  if (linesMat.rows() == 0) {
+                      tableRoi.release()
+                      return AutoAimResult(
+                          tableDetected = true,
+                          tableBounds = bounds,
+                          ballRadius = dynamicBallRadius,
+                          hasAimLine = false
+                      )
+                  }
+
+                  var maxLen = 0.0
+                  var bestLine = doubleArrayOf(0.0, 0.0, 0.0, 0.0)
+                  for (i in 0 until linesMat.rows()) {
+                      val l = linesMat.get(i, 0)
+                      val len = hypot(l[2] - l[0], l[3] - l[1])
+                      if (len > maxLen) {
+                          maxLen = len
+                          bestLine = l
+                      }
+                  }
+
+                  val x1 = (bestLine[0] + roiRect.x).toFloat()
+                  val y1 = (bestLine[1] + roiRect.y).toFloat()
+                  val x2 = (bestLine[2] + roiRect.x).toFloat()
+                  val y2 = (bestLine[3] + roiRect.y).toFloat()
+
+                  Imgproc.GaussianBlur(grayMat, grayMat, Size(5.0, 5.0), 1.4)
+                  Imgproc.HoughCircles(
+                      grayMat,
+                      circlesMat,
+                      Imgproc.HOUGH_GRADIENT,
+                      1.2,
+                      (dynamicBallRadius * 1.4).toDouble(),
+                      100.0,
+                      20.0,
+                      (dynamicBallRadius * 0.7).toInt(),
+                      (dynamicBallRadius * 1.4).toInt()
+                  )
+
+                  var startPt = PointF(x1, y1)
+                  var endPt = PointF(x2, y2)
+                  var foundBallImpact = false
+                  var objVec = PointF()
+                  var tangentVec = PointF()
+
+                  for (i in 0 until circlesMat.cols()) {
+                      val c = circlesMat.get(0, i) ?: continue
+                      val cx = (c[0] + roiRect.x).toFloat()
+                      val cy = (c[1] + roiRect.y).toFloat()
+
+                      val distToP1 = hypot(cx - x1, cy - y1)
+                      val distToP2 = hypot(cx - x2, cy - y2)
+
+                      if (distToP1 < dynamicBallRadius * 1.9f) {
+                          startPt = PointF(x2, y2)
+                          endPt = PointF(cx, cy)
+                      } else if (distToP2 < dynamicBallRadius * 1.9f) {
+                          startPt = PointF(x1, y1)
+                          endPt = PointF(cx, cy)
+                      }
+                  }
+
+                  val dx = endPt.x - startPt.x
+                  val dy = endPt.y - startPt.y
+                  val norm = hypot(dx, dy).coerceAtLeast(0.001f)
+                  val aimDir = PointF(dx / norm, dy / norm)
+
+                  for (i in 0 until circlesMat.cols()) {
+                      val c = circlesMat.get(0, i) ?: continue
+                      val ox = (c[0] + roiRect.x).toFloat()
+                      val oy = (c[1] + roiRect.y).toFloat()
+                      val distFromGhost = hypot(ox - endPt.x, oy - endPt.y)
+
+                      if (distFromGhost in (dynamicBallRadius * 1.55f)..(dynamicBallRadius * 2.45f)) {
+                          foundBallImpact = true
+                          val odx = ox - endPt.x
+                          val ody = oy - endPt.y
+                          val onorm = hypot(odx, ody).coerceAtLeast(0.001f)
+                          objVec = PointF(odx / onorm, ody / onorm)
+
+                          val cross = aimDir.x * objVec.y - aimDir.y * objVec.x
+                          tangentVec = if (cross > 0f) {
+                              PointF(objVec.y, -objVec.x)
+                          } else {
+                              PointF(-objVec.y, objVec.x)
+                          }
+                          break
+                      }
+                  }
+
+                  tableRoi.release()
+
+                  return AutoAimResult(
+                      tableDetected = true,
+                      tableBounds = bounds,
+                      ballRadius = dynamicBallRadius,
+                      hasAimLine = true,
+                      cueStart = startPt,
+                      impactCenter = endPt,
+                      aimVector = aimDir,
+                      isBallCollision = foundBallImpact,
+                      objectBallVector = objVec,
+                      cueDeflectionVector = tangentVec
+                  )
+              }
+
+              private fun autoDetectTablePlayfield(frame: Mat): RectF? {
+                  Imgproc.cvtColor(frame, hsvMat, Imgproc.COLOR_RGB2HSV)
+
+                  val cx = hsvMat.cols() / 2
+                  val cy = hsvMat.rows() / 2
+                  if (cx < 30 || cy < 30) return null
+
+                  val centerPatch = hsvMat.submat(cy - 20, cy + 20, cx - 20, cx + 20)
+                  val meanHsv = Core.mean(centerPatch)
+                  centerPatch.release()
+
+                  val lowerFelt = Scalar(
+                      (meanHsv.`val`[0] - 20).coerceAtLeast(0.0),
+                      35.0,
+                      30.0
+                  )
+                  val upperFelt = Scalar(
+                      (meanHsv.`val`[0] + 20).coerceAtMost(180.0),
+                      255.0,
+                      255.0
+                  )
+
+                  Core.inRange(hsvMat, lowerFelt, upperFelt, maskMat)
+
+                  val contours = ArrayList<MatOfPoint>()
+                  val hierarchy = Mat()
+                  Imgproc.findContours(maskMat, contours, hierarchy, Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE)
+                  hierarchy.release()
+
+                  var maxArea = 0.0
+                  var bestRect: Rect? = null
+                  for (contour in contours) {
+                      val area = Imgproc.contourArea(contour)
+                      if (area > maxArea) {
+                          maxArea = area
+                          bestRect = Imgproc.boundingRect(contour)
+                      }
+                      contour.release()
+                  }
+
+                  val screenArea = frame.cols() * frame.rows()
+                  if (bestRect != null && maxArea > screenArea * 0.22) {
+                      return RectF(
+                          bestRect.x.toFloat(),
+                          bestRect.y.toFloat(),
+                          (bestRect.x + bestRect.width).toFloat(),
+                          (bestRect.y + bestRect.height).toFloat()
+                      )
+                  }
+                  return null
+              }
+
+              private fun imageToBitmap(image: Image): Bitmap {
+                  val plane = image.planes[0]
+                  val buffer = plane.buffer
+                  val pixelStride = plane.pixelStride
+                  val rowStride = plane.rowStride
+                  val rowPadding = rowStride - pixelStride * image.width
+
+                  val bitmap = Bitmap.createBitmap(
+                      image.width + rowPadding / pixelStride,
+                      image.height,
+                      Bitmap.Config.ARGB_8888
+                  )
+                  bitmap.copyPixelsFromBuffer(buffer)
+                  return Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height)
+              }
+          }
+          EOF
+
+          # ---------------------------------------------------------
+          # 7. TrajectoryOverlayView.kt (Cushion Compression + Spin Bezier Curves)
+          # ---------------------------------------------------------
+          cat << 'EOF' > app/src/main/java/com/example/poolaimassistant/TrajectoryOverlayView.kt
+          package com.example.poolaimassistant
+
+          import android.content.Context
+          import android.graphics.*
+          import android.view.View
+          import kotlin.math.hypot
+          import kotlin.math.min
+
+          class TrajectoryOverlayView(context: Context) : View(context) {
+
+              private var currentState: AutoAimResult? = null
+
+              var maxBounces: Int = 2
+              var cushionRestitution: Float = 0.86f
+              var spinFactor: Float = 0.0f
+
+              private val spinCurvePath = Path()
+
+              private val tableBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.argb(100, 0, 255, 200)
+                  style = Paint.Style.STROKE
+                  strokeWidth = 3f
+              }
+
+              private val pocketZonePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.argb(90, 0, 255, 100)
+                  style = Paint.Style.FILL
+              }
+
+              private val primaryLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.CYAN
+                  style = Paint.Style.STROKE
+                  strokeWidth = 5f
+              }
+
+              private val objectBallLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.GREEN
+                  style = Paint.Style.STROKE
+                  strokeWidth = 5.5f
+              }
+
+              private val stunTangentPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.argb(140, 255, 215, 0)
+                  style = Paint.Style.STROKE
+                  strokeWidth = 3.5f
+                  pathEffect = DashPathEffect(floatArrayOf(14f, 10f), 0f)
+              }
+
+              private val spinCurvePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.rgb(255, 140, 0)
+                  style = Paint.Style.STROKE
+                  strokeWidth = 5f
+              }
+
+              fun updateOverlay(result: AutoAimResult) {
+                  currentState = result
+                  postInvalidateOnAnimation()
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  val state = currentState ?: return
+                  if (!state.tableDetected) return
+
+                  canvas.drawRect(state.tableBounds, tableBorderPaint)
+                  drawPocketZones(canvas, state.tableBounds, state.ballRadius * 1.65f)
+
+                  if (!state.hasAimLine) return
+
+                  if (state.isBallCollision) {
+                      canvas.drawLine(
+                          state.cueStart.x, state.cueStart.y,
+                          state.impactCenter.x, state.impactCenter.y,
+                          primaryLinePaint
+                      )
+                      canvas.drawCircle(
+                          state.impactCenter.x, state.impactCenter.y,
+                          state.ballRadius, objectBallLinePaint
+                      )
+
+                      drawRayWithCompression(
+                          canvas,
+                          state.impactCenter,
+                          state.objectBallVector,
+                          state.tableBounds,
+                          state.ballRadius,
+                          1,
+                          objectBallLinePaint
+                      )
+
+                      drawRayWithCompression(
+                          canvas,
+                          state.impactCenter,
+                          state.cueDeflectionVector,
+                          state.tableBounds,
+                          state.ballRadius,
+                          0,
+                          stunTangentPaint
+                      )
+
+                      drawSpinDeflectionCurve(
+                          canvas,
+                          state.impactCenter,
+                          state.aimVector,
+                          state.cueDeflectionVector,
+                          state.ballRadius
+                      )
+                  } else {
+                      drawRayWithCompression(
+                          canvas,
+                          state.cueStart,
+                          state.aimVector,
+                          state.tableBounds,
+                          state.ballRadius,
+                          maxBounces,
+                          primaryLinePaint
+                      )
+                  }
+              }
+
+              private fun drawSpinDeflectionCurve(
+                  canvas: Canvas,
+                  p0: PointF,
+                  aimVec: PointF,
+                  tangentVec: PointF,
+                  radius: Float
+              ) {
+                  val slideDist = radius * 3.4f
+                  val rollDist = radius * 9.5f
+
+                  val p1x = p0.x + tangentVec.x * slideDist
+                  val p1y = p0.y + tangentVec.y * slideDist
+
+                  val blendX = tangentVec.x + spinFactor * aimVec.x
+                  val blendY = tangentVec.y + spinFactor * aimVec.y
+                  val norm = hypot(blendX, blendY).coerceAtLeast(0.001f)
+
+                  val p2x = p1x + (blendX / norm) * rollDist
+                  val p2y = p1y + (blendY / norm) * rollDist
+
+                  spinCurvePath.reset()
+                  spinCurvePath.moveTo(p0.x, p0.y)
+                  spinCurvePath.quadTo(p1x, p1y, p2x, p2y)
+                  canvas.drawPath(spinCurvePath, spinCurvePaint)
+              }
+
+              private fun drawRayWithCompression(
+                  canvas: Canvas,
+                  origin: PointF,
+                  direction: PointF,
+                  bounds: RectF,
+                  radius: Float,
+                  bounces: Int,
+                  paint: Paint
+              ) {
+                  val minX = bounds.left + radius
+                  val maxX = bounds.right - radius
+                  val minY = bounds.top + radius
+                  val maxY = bounds.bottom - radius
+
+                  var sx = origin.x
+                  var sy = origin.y
+                  var vx = direction.x
+                  var vy = direction.y
+
+                  for (i in 0..bounces) {
+                      val tx = when {
+                          vx > 0.0001f -> (maxX - sx) / vx
+                          vx < -0.0001f -> (minX - sx) / vx
+                          else -> Float.MAX_VALUE
+                      }
+                      val ty = when {
+                          vy > 0.0001f -> (maxY - sy) / vy
+                          vy < -0.0001f -> (minY - sy) / vy
+                          else -> Float.MAX_VALUE
+                      }
+
+                      val t = min(tx, ty)
+                      if (t == Float.MAX_VALUE || t < 0f) break
+
+                      val hitX = sx + vx * t
+                      val hitY = sy + vy * t
+
+                      canvas.drawLine(sx, sy, hitX, hitY, paint)
+                      canvas.drawCircle(hitX, hitY, radius, paint)
+
+                      val railFriction = 0.94f
+                      if (tx < ty) {
+                          vx = -vx * cushionRestitution
+                          vy *= railFriction
+                      } else {
+                          vy = -vy * cushionRestitution
+                          vx *= railFriction
+                      }
+
+                      val vNorm = hypot(vx, vy).coerceAtLeast(0.001f)
+                      vx /= vNorm
+                      vy /= vNorm
+
+                      sx = hitX
+                      sy = hitY
+                  }
+              }
+
+              private fun drawPocketZones(canvas: Canvas, bounds: RectF, pocketRadius: Float) {
+                  val midX = bounds.centerX()
+                  canvas.drawCircle(bounds.left, bounds.top, pocketRadius, pocketZonePaint)
+                  canvas.drawCircle(midX, bounds.top, pocketRadius, pocketZonePaint)
+                  canvas.drawCircle(bounds.right, bounds.top, pocketRadius, pocketZonePaint)
+                  canvas.drawCircle(bounds.left, bounds.bottom, pocketRadius, pocketZonePaint)
+                  canvas.drawCircle(midX, bounds.bottom, pocketRadius, pocketZonePaint)
+                  canvas.drawCircle(bounds.right, bounds.bottom, pocketRadius, pocketZonePaint)
+              }
+          }
+          EOF
+
+          # ---------------------------------------------------------
+          # 8. AimOverlayService.kt (Floating Pill + Screen Capture)
+          # ---------------------------------------------------------
+          cat << 'EOF' > app/src/main/java/com/example/poolaimassistant/AimOverlayService.kt
+          package com.example.poolaimassistant
+
+          import android.annotation.SuppressLint
+          import android.app.*
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.hardware.display.DisplayManager
+          import android.hardware.display.VirtualDisplay
+          import android.media.ImageReader
+          import android.media.projection.MediaProjection
+          import android.media.projection.MediaProjectionManager
+          import android.os.*
+          import android.view.*
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import androidx.core.app.NotificationCompat
+          import kotlin.math.abs
+
+          class AimOverlayService : Service() {
+
+              private lateinit var windowManager: WindowManager
+              private lateinit var trajectoryView: TrajectoryOverlayView
+              private lateinit var floatingWidget: LinearLayout
+
+              private val visionEngine = AutoTableVisionEngine()
+              private var mediaProjection: MediaProjection? = null
+              private var virtualDisplay: VirtualDisplay? = null
+              private var imageReader: ImageReader? = null
+
+              private var isGuidelineEnabled = true
+              private var spinModeIndex = 0
+
+              private val handlerThread = HandlerThread("AimVisionThread").apply { start() }
+              private val backgroundHandler = Handler(handlerThread.looper)
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  startMyForeground()
+                  windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  setupClickThroughTrajectoryCanvas()
+                  setupFloatingControlWindow()
+              }
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  val resultCode = intent?.getIntExtra("RESULT_CODE", Activity.RESULT_CANCELED) ?: Activity.RESULT_CANCELED
+                  val data: Intent? = intent?.getParcelableExtra("DATA")
+
+                  if (resultCode == Activity.RESULT_OK && data != null) {
+                      startScreenCapture(resultCode, data)
+                  }
+                  return START_NOT_STICKY
+              }
+
+              private fun setupClickThroughTrajectoryCanvas() {
+                  trajectoryView = TrajectoryOverlayView(this)
+
+                  val canvasParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.MATCH_PARENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                              WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                              WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                  }
+
+                  windowManager.addView(trajectoryView, canvasParams)
+              }
+
+              @SuppressLint("ClickableViewAccessibility")
+              private fun setupFloatingControlWindow() {
+                  val widgetParams = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = 36
+                      y = 100
+                  }
+
+                  val bgDrawable = GradientDrawable().apply {
+                      setColor(Color.argb(215, 18, 24, 36))
+                      cornerRadius = 42f
+                      setStroke(3, Color.CYAN)
+                  }
+
+                  floatingWidget = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      background = bgDrawable
+                      setPadding(16, 10, 16, 10)
+                  }
+
+                  val menuContainer = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      visibility = View.GONE
+                  }
+
+                  val toggleLineBtn = Button(this).apply {
+                      text = "Line: ON"
+                      textSize = 11f
+                      setOnClickListener {
+                          isGuidelineEnabled = !isGuidelineEnabled
+                          text = if (isGuidelineEnabled) "Line: ON" else "Line: OFF"
+                          trajectoryView.visibility = if (isGuidelineEnabled) View.VISIBLE else View.INVISIBLE
+                      }
+                  }
+
+                  val bounceBtn = Button(this).apply {
+                      text = "Bounce: 2"
+                      textSize = 11f
+                      setOnClickListener {
+                          trajectoryView.maxBounces = (trajectoryView.maxBounces % 3) + 1
+                          text = "Bounce: ${trajectoryView.maxBounces}"
+                      }
+                  }
+
+                  val spinBtn = Button(this).apply {
+                      text = "Spin: Stun"
+                      textSize = 11f
+                      setOnClickListener {
+                          spinModeIndex = (spinModeIndex + 1) % 3
+                          when (spinModeIndex) {
+                              0 -> {
+                                  trajectoryView.spinFactor = 0.0f
+                                  text = "Spin: Stun"
+                              }
+                              1 -> {
+                                  trajectoryView.spinFactor = 0.95f
+                                  text = "Spin: Top"
+                              }
+                              2 -> {
+                                  trajectoryView.spinFactor = -0.95f
+                                  text = "Spin: Back"
+                              }
+                          }
+                      }
+                  }
+
+                  val recalibrateBtn = Button(this).apply {
+                      text = "Re-Scan"
+                      textSize = 11f
+                      setOnClickListener {
+                          visionEngine.forceRecalibrateTable()
+                      }
+                  }
+
+                  val closeBtn = Button(this).apply {
+                      text = "✕"
+                      textSize = 12f
+                      setTextColor(Color.RED)
+                      setOnClickListener { stopSelf() }
+                  }
+
+                  menuContainer.addView(toggleLineBtn)
+                  menuContainer.addView(bounceBtn)
+                  menuContainer.addView(spinBtn)
+                  menuContainer.addView(recalibrateBtn)
+                  menuContainer.addView(closeBtn)
+
+                  val mainBubbleBtn = Button(this).apply {
+                      text = "🎯"
+                      textSize = 16f
+                      setBackgroundColor(Color.TRANSPARENT)
+                  }
+
+                  var initialX = 0
+                  var initialY = 0
+                  var touchX = 0f
+                  var touchY = 0f
+                  var isDragging = false
+
+                  mainBubbleBtn.setOnTouchListener { _, event ->
+                      when (event.action) {
+                          MotionEvent.ACTION_DOWN -> {
+                              initialX = widgetParams.x
+                              initialY = widgetParams.y
+                              touchX = event.rawX
+                              touchY = event.rawY
+                              isDragging = false
+                              true
+                          }
+                          MotionEvent.ACTION_MOVE -> {
+                              val dx = (event.rawX - touchX).toInt()
+                              val dy = (event.rawY - touchY).toInt()
+                              if (abs(dx) > 10 || abs(dy) > 10) {
+                                  isDragging = true
+                                  widgetParams.x = initialX + dx
+                                  widgetParams.y = initialY + dy
+                                  windowManager.updateViewLayout(floatingWidget, widgetParams)
+                              }
+                              true
+                          }
+                          MotionEvent.ACTION_UP -> {
+                              if (!isDragging) {
+                                  menuContainer.visibility =
+                                      if (menuContainer.visibility == View.VISIBLE) View.GONE else View.VISIBLE
+                              }
+                              true
+                          }
+                          else -> false
+                      }
+                  }
+
+                  floatingWidget.addView(mainBubbleBtn)
+                  floatingWidget.addView(menuContainer)
+                  windowManager.addView(floatingWidget, widgetParams)
+              }
+
+              private fun startScreenCapture(resultCode: Int, data: Intent) {
+                  val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                  mediaProjection = mpManager.getMediaProjection(resultCode, data)
+
+                  mediaProjection?.registerCallback(object : MediaProjection.Callback() {
+                      override fun onStop() {
+                          stopSelf()
+                      }
+                  }, backgroundHandler)
+
+                  val metrics = resources.displayMetrics
+                  imageReader = ImageReader.newInstance(
+                      metrics.widthPixels,
+                      metrics.heightPixels,
+                      PixelFormat.RGBA_8888,
+                      2
+                  )
+
+                  virtualDisplay = mediaProjection?.createVirtualDisplay(
+                      "AimMasterProjection",
+                      metrics.widthPixels,
+                      metrics.heightPixels,
+                      metrics.densityDpi,
+                      DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                      imageReader?.surface,
+                      null,
+                      backgroundHandler
+                  )
+
+                  imageReader?.setOnImageAvailableListener({ reader ->
+                      val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                      try {
+                          if (isGuidelineEnabled) {
+                              val result = visionEngine.analyzeFrame(image)
+                              trajectoryView.updateOverlay(result)
+                          }
+                      } finally {
+                          image.close()
+                      }
+                  }, backgroundHandler)
+              }
+
+              private fun startMyForeground() {
+                  val channelId = "aim_overlay_channel"
+                  val channel = NotificationChannel(
+                      channelId, "Aim Master Service",
+                      NotificationManager.IMPORTANCE_LOW
+                  )
+                  getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+
+                  val notification = NotificationCompat.Builder(this, channelId)
+                      .setContentTitle("Aim Master Pro Active")
+                      .setContentText("Tap floating 🎯 icon to adjust bounces & spin")
+                      .setSmallIcon(android.R.drawable.ic_menu_compass)
+                      .build()
+
+                  startForeground(1, notification)
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  virtualDisplay?.release()
+                  imageReader?.close()
+                  mediaProjection?.stop()
+                  handlerThread.quitSafely()
+                  if (::trajectoryView.isInitialized) windowManager.removeView(trajectoryView)
+                  if (::floatingWidget.isInitialized) windowManager.removeView(floatingWidget)
+              }
+          }
+          EOF
+
+          # ---------------------------------------------------------
+          # 9. MainActivity.kt (Tap to Play -> Screen Share -> Auto-Launch Game)
+          # ---------------------------------------------------------
+          cat << 'EOF' > app/src/main/java/com/example/poolaimassistant/MainActivity.kt
+          package com.example.poolaimassistant
+
+          import android.app.Activity
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Color
+          import android.media.projection.MediaProjectionManager
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var mpManager: MediaProjectionManager
+              private val targetGamePackage = "com.miniclip.eightballpool"
+
+              private val screenShareLauncher = registerForActivityResult(
+                  ActivityResultContracts.StartActivityForResult()
+              ) { result ->
+                  if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+                      val serviceIntent = Intent(this, AimOverlayService::class.java).apply {
+                          putExtra("RESULT_CODE", result.resultCode)
+                          putExtra("DATA", result.data)
+                      }
+                      startForegroundService(serviceIntent)
+                      launchTargetPoolGame()
+                  } else {
+                      Toast.makeText(this, "Screen Share required for auto-detection", Toast.LENGTH_SHORT).show()
+                  }
+              }
+
+              private val overlayPermissionLauncher = registerForActivityResult(
+                  ActivityResultContracts.StartActivityForResult()
+              ) {
+                  if (Settings.canDrawOverlays(this)) {
+                      screenShareLauncher.launch(mpManager.createScreenCaptureIntent())
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#0F172A"))
+                      setPadding(64, 64, 64, 64)
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "🎱 AIM MASTER PRO"
+                      textSize = 24f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, 24)
+                  }
+
+                  val subtitle = TextView(this).apply {
+                      text = "Auto-Table Detection • 3-Line • Cushion Compression • Spin Curve"
+                      textSize = 13f
+                      setTextColor(Color.parseColor("#94A3B8"))
+                      gravity = Gravity.CENTER
+                      setPadding(0, 0, 0, 64)
+                  }
+
+                  val playBtn = Button(this).apply {
+                      text = "TAP TO PLAY"
+                      textSize = 18f
+                      setBackgroundColor(Color.parseColor("#10B981"))
+                      setTextColor(Color.BLACK)
+                      setPadding(72, 36, 72, 36)
+                      setOnClickListener { startOneTapFlow() }
+                  }
+
+                  root.addView(title)
+                  root.addView(subtitle)
+                  root.addView(playBtn)
+                  setContentView(root)
+              }
+
+              private fun startOneTapFlow() {
+                  if (Settings.canDrawOverlays(this)) {
+                      screenShareLauncher.launch(mpManager.createScreenCaptureIntent())
+                  } else {
+                      val intent = Intent(
+                          Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                          Uri.parse("package:$packageName")
+                      )
+                      overlayPermissionLauncher.launch(intent)
+                  }
+              }
+
+              private fun launchTargetPoolGame() {
+                  val launchIntent = packageManager.getLaunchIntentForPackage(targetGamePackage)
+                  if (launchIntent != null) {
+                      launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      startActivity(launchIntent)
+                      finish()
+                  } else {
+                      Toast.makeText(
+                          this,
+                          "Overlay Active! Open your pool game to start auto-tracking.",
+                          Toast.LENGTH_LONG
+                      ).show()
+                      moveTaskToBack(true)
+                  }
+              }
+          }
+          EOF
+
+      - name: 3. Commit Unpacked Source Tree to Repository (If Not Yet Committed)
+        continue-on-error: true
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add settings.gradle.kts build.gradle.kts gradle.properties app/
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto-unpack Android project structure [skip ci]"
+            git push
+          fi
+
+      - name: 4. Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: 5. Setup Gradle 8.6 & Build Debug APK
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: 8.6
+
+      - name: Compile APK with Gradle 8.6
+        run: |
+          gradle assembleDebug --no-daemon
+
+      - name: 6. Upload Installable APK to Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AimMasterPro-Debug-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: 7. Publish APK to GitHub Releases (Automatic Download Link)
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push'
+        continue-on-error: true
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "Aim Master Pro APK Build #${{ github.run_number }}"
+          files: app/build/outputs/apk/debug/app-debug.apk
